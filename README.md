@@ -6,9 +6,7 @@ Infinite procedural ASCII space explorer. Runs in your terminal like `sl`.
 ## Install (any Linux / WSL)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/universe/main/universe \
-  | sudo tee /usr/local/bin/universe > /dev/null && \
-  sudo chmod +x /usr/local/bin/universe
+curl -fsSL https://raw.githubusercontent.com/deepith-18/Cosmos/main/install.sh | bash
 ```
 
 ## Run
