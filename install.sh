@@ -3,7 +3,7 @@
 echo "Installing Cosmos..."
 
 sudo curl -fsSL \
-https://raw.githubusercontent.com/deepith-18/Cosmos/main/universe \
+"https://raw.githubusercontent.com/deepith-18/Cosmos/main/universe" \
 -o /usr/local/bin/universe
 
 sudo chmod +x /usr/local/bin/universe
