@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""
+universe — Infinite Procedural ASCII Space Explorer
+Runs entirely in the terminal. Like sl, but space.
+
+Controls:
+  W A S D       — fly your ship
+  Arrow keys    — also move
+  + / -         — zoom in / out
+  SHIFT moves   — warp speed (hold shift conceptually via speed toggle)
+  SPACE         — scan & discover nearby objects
+  T             — toggle speed (normal / warp)
+  R             — regenerate universe (new seed)
+  Q / ESC       — quit
+"""
+
+import curses
+import math
+import random
+import time
+import sys
+
+# ─── Seeded hash RNG ─────────────────────────────────────────────────────────
+def hash_rng(seed):
+    """Deterministic pseudo-random float [0,1) from integer seed."""
+    seed = int(seed) & 0xFFFFFFFF
+    seed = ((seed >> 16) ^ seed) * 0x45D9F3B & 0xFFFFFFFF
+    seed = ((seed >> 16) ^ seed) * 0x45D9F3B & 0xFFFFFFFF
+    seed = (seed >> 16) ^ seed
+    return (seed & 0xFFFFFF) / 0xFFFFFF
+
+def chunk_rand(cx, cy, idx, universe_seed):
+    s = (cx * 73856093) ^ (cy * 19349663) ^ (idx * 2654435761) ^ universe_seed
+    return hash_rng(s)
+
+# ─── Name generators ──────────────────────────────────────────────────────────
+PLANET_PRE = ['Kel','Vor','Zyx','Ath','Nar','Sol','Dra','Ven','Ix','Qu','Mor','Tel','Ara','Zor']
+PLANET_SUF = ['ara','ion','ius','ax','en','on','us','ix','al','ar','el','or','ath','ys']
+ALIEN_PRE  = ['Zr','Kl','Vx','Th','Ng','Xl','Qr','Pr','Kr']
+ALIEN_SUF  = ["'ak","'ul","ian","oth","yx","ara","ell","oth","ix"]
+ALPHA      = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
+SECTORS    = ['ALPHA','BETA','GAMMA','DELTA','EPSILON','ZETA','ETA','THETA','IOTA','KAPPA']
+GALAXIES   = ['Milky Way','Andromeda','Triangulum','Whirlpool','Sombrero','Cartwheel','Tadpole','Pinwheel']
+
+def planet_name(r0, r1):
+    return PLANET_PRE[int(r0 * len(PLANET_PRE))] + PLANET_SUF[int(r1 * len(PLANET_SUF))]
+
+def alien_name(r0, r1):
+    return ALIEN_PRE[int(r0 * len(ALIEN_PRE))] + ALIEN_SUF[int(r1 * len(ALIEN_SUF))]
+
+def star_id(r0, r1, r2):
+    return ALPHA[int(r0*len(ALPHA))] + ALPHA[int(r1*len(ALPHA))] + '-' + str(100 + int(r2 * 900))
+
+def sector_name(cx, cy):
+    h = abs(cx * 31 + cy * 17) % len(SECTORS)
+    n = abs(cx + cy * 7) % 9
+    return f"{SECTORS[h]}-{n}"
+
+def galaxy_name(cx, cy):
+    h = abs(cx * 7 + cy * 13) % len(GALAXIES)
+    return GALAXIES[h]
+
+# ─── Object types ─────────────────────────────────────────────────────────────
+# (char, type_name, color_pair_id)
+# We'll assign curses color pairs:
+#  1 = white/black   (stars)
+#  2 = cyan/black    (planets)
+#  3 = magenta/black (black holes)
+#  4 = yellow/black  (nebulae)
+#  5 = green/black   (alien)
+#  6 = dim/black     (background stars)
+#  7 = red/black     (danger)
+#  8 = blue/black    (distant stars)
+
+STAR_CHARS   = ['.', '+', '*', '✦', '⊹', '×', '˙']
+PLANET_CHARS = ['O', 'o', '@', '0', 'Q', 'C', 'G']
+BH_CHARS     = ['&', '%', '#', '§', 'Ø']
+NEBULA_CHARS = ['~', '≈', '-', '=', ';']
+ALIEN_CHARS  = ['$', '?', '!', 'W', 'M']
+BG_CHARS     = ['.', ' ', ' ', ' ', ' ', '·', ' ']
+
+CHUNK_SIZE = 40  # world units per chunk
+
+def get_chunk_entities(cx, cy, useed):
+    """Return list of (lx, ly, char, type_name, color_pair, name) for a chunk."""
+    r = lambda idx: chunk_rand(cx, cy, idx, useed)
+    count = int(r(0) * 15) + 3
+    entities = []
+    for i in range(count):
+        base = i * 20
+        lx = r(base + 1)
+        ly = r(base + 2)
+        roll = r(base + 3)
+
+        if roll < 0.012:
+            ch   = ALIEN_CHARS[int(r(base+4) * len(ALIEN_CHARS))]
+            typ  = 'Alien System'
+            col  = 5
+            name = alien_name(r(base+5), r(base+6))
+        elif roll < 0.04:
+            ch   = BH_CHARS[int(r(base+4) * len(BH_CHARS))]
+            typ  = 'Black Hole'
+            col  = 3
+            name = 'BH-' + star_id(r(base+5), r(base+6), r(base+7))
+        elif roll < 0.13:
+            ch   = NEBULA_CHARS[int(r(base+4) * len(NEBULA_CHARS))]
+            typ  = 'Nebula'
+            col  = 4
+            name = 'Nebula ' + star_id(r(base+5), r(base+6), r(base+7))
+        elif roll < 0.32:
+            ch   = PLANET_CHARS[int(r(base+4) * len(PLANET_CHARS))]
+            typ  = 'Planet'
+            col  = 2
+            name = planet_name(r(base+5), r(base+6))
+        else:
+            ch   = STAR_CHARS[int(r(base+4) * len(STAR_CHARS))]
+            typ  = 'Star'
+            col  = 1
+            name = 'Star ' + star_id(r(base+5), r(base+6), r(base+7))
+
+        entities.append((lx, ly, ch, typ, col, name))
+    return entities
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+def main(stdscr):
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+
+    # Init colors
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_WHITE,   -1)  # stars
+    curses.init_pair(2, curses.COLOR_CYAN,    -1)  # planets
+    curses.init_pair(3, curses.COLOR_MAGENTA, -1)  # black holes
+    curses.init_pair(4, curses.COLOR_YELLOW,  -1)  # nebulae
+    curses.init_pair(5, curses.COLOR_GREEN,   -1)  # alien
+    curses.init_pair(6, curses.COLOR_BLACK,   -1)  # bg (bold = dim white on some terms)
+    curses.init_pair(7, curses.COLOR_RED,     -1)  # danger
+    curses.init_pair(8, curses.COLOR_BLUE,    -1)  # distant
+
+    # State
+    universe_seed = int(time.time()) & 0xFFFFFFFF
+    cam_x, cam_y  = 0.0, 0.0
+    zoom          = 1.0
+    warp          = False
+    chunk_cache   = {}
+    discovered    = set()
+    disc_counts   = {'Planet':0,'Star':0,'Black Hole':0,'Nebula':0,'Alien System':0}
+    disc_msg      = ''
+    disc_msg_time = 0
+    frame         = 0
+
+    # Ship chars
+    SHIP = [' /^\\ ', '(o o)', ' \\=/ ']
+
+    def get_chunk(cx, cy):
+        k = (cx, cy)
+        if k not in chunk_cache:
+            chunk_cache[k] = get_chunk_entities(cx, cy, universe_seed)
+        return chunk_cache[k]
+
+    def reset_universe():
+        nonlocal universe_seed, cam_x, cam_y, zoom, warp, disc_msg
+        nonlocal chunk_cache, discovered, disc_counts
+        universe_seed = int(time.time() * 1000) & 0xFFFFFFFF
+        cam_x, cam_y = 0.0, 0.0
+        zoom = 1.0
+        warp = False
+        chunk_cache.clear()
+        discovered.clear()
+        disc_counts = {'Planet':0,'Star':0,'Black Hole':0,'Nebula':0,'Alien System':0}
+        disc_msg = '[ NEW UNIVERSE GENERATED ]'
+
+    def do_scan():
+        nonlocal disc_msg, disc_msg_time
+        found = []
+        scan_r = 6.0 / zoom
+        cx0 = int(cam_x / CHUNK_SIZE)
+        cy0 = int(cam_y / CHUNK_SIZE)
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                cx, cy = cx0+dx, cy0+dy
+                for (lx, ly, ch, typ, col, name) in get_chunk(cx, cy):
+                    wx = cx*CHUNK_SIZE + lx*CHUNK_SIZE
+                    wy = cy*CHUNK_SIZE + ly*CHUNK_SIZE
+                    dist = math.sqrt((wx-cam_x)**2 + (wy-cam_y)**2)
+                    if dist < scan_r:
+                        key = f"{round(wx*10)},{round(wy*10)}"
+                        if key not in discovered:
+                            discovered.add(key)
+                            disc_counts[typ] = disc_counts.get(typ, 0) + 1
+                            found.append((typ, name))
+        if found:
+            t, n = found[0]
+            disc_msg = f'[ {t.upper()} DISCOVERED: {n} ]'
+        else:
+            disc_msg = '[ DEEP SPACE - NO OBJECTS IN RANGE ]'
+        disc_msg_time = time.time()
+
+    last_time = time.time()
+
+    while True:
+        now = time.time()
+        dt  = min(now - last_time, 0.05)
+        last_time = now
+        frame += 1
+
+        # ── Input ──────────────────────────────────────────────────────────
+        key = stdscr.getch()
+        if key in (ord('q'), ord('Q'), 27):
+            break
+        elif key in (ord('r'), ord('R')):
+            reset_universe()
+        elif key in (ord('t'), ord('T')):
+            warp = not warp
+        elif key in (ord('+'), ord('=')):
+            zoom = min(6.0, zoom * 1.2)
+        elif key in (ord('-'), ord('_')):
+            zoom = max(0.15, zoom / 1.2)
+        elif key == ord(' '):
+            do_scan()
+
+        # Movement
+        spd = (4.0 if warp else 1.0) * (1.0 / zoom) * 0.6
+        if key in (ord('w'), ord('W'), curses.KEY_UP):    cam_y -= spd
+        if key in (ord('s'), ord('S'), curses.KEY_DOWN):  cam_y += spd
+        if key in (ord('a'), ord('A'), curses.KEY_LEFT):  cam_x -= spd
+        if key in (ord('d'), ord('D'), curses.KEY_RIGHT): cam_x += spd
+
+        # ── Render ─────────────────────────────────────────────────────────
+        rows, cols = stdscr.getmaxyx()
+        stdscr.erase()
+
+        half_w = (cols / 2) / zoom
+        half_h = (rows / 2) / zoom
+        world_l = cam_x - half_w
+        world_t = cam_y - half_h
+        world_r = cam_x + half_w
+        world_b = cam_y + half_h
+
+        # Background star field (stable hash per cell)
+        for row in range(rows - 1):
+            for col in range(cols - 1):
+                wx = world_l + col / zoom
+                wy = world_t + row / zoom
+                iwx = int(wx * 2)
+                iwy = int(wy * 2)
+                h = abs((iwx * 374761393 + iwy * 668265263 + universe_seed) & 0x7FFFFFFF)
+                if h % 120 == 0:
+                    try: stdscr.addch(row, col, '.', curses.color_pair(6) | curses.A_DIM)
+                    except curses.error: pass
+                elif h % 250 == 1:
+                    try: stdscr.addch(row, col, '\xb7' if False else ',', curses.color_pair(8) | curses.A_DIM)
+                    except curses.error: pass
+
+        # Chunks
+        cx_min = int(world_l / CHUNK_SIZE) - 1
+        cx_max = int(world_r / CHUNK_SIZE) + 1
+        cy_min = int(world_t / CHUNK_SIZE) - 1
+        cy_max = int(world_b / CHUNK_SIZE) + 1
+
+        nearest = None
+        nearest_dist = 1e9
+
+        for cy in range(cy_min, cy_max + 1):
+            for cx in range(cx_min, cx_max + 1):
+                for (lx, ly, ch, typ, col, name) in get_chunk(cx, cy):
+                    wx = cx * CHUNK_SIZE + lx * CHUNK_SIZE
+                    wy = cy * CHUNK_SIZE + ly * CHUNK_SIZE
+                    scol = int((wx - world_l) * zoom)
+                    srow = int((wy - world_t) * zoom)
+                    if 0 <= srow < rows - 1 and 0 <= scol < cols - 1:
+                        attr = curses.color_pair(col)
+                        if typ == 'Black Hole': attr |= curses.A_BOLD
+                        if typ == 'Alien System': attr |= curses.A_BLINK if frame % 20 < 10 else curses.A_BOLD
+                        if typ == 'Planet': attr |= curses.A_BOLD
+                        try: stdscr.addch(srow, scol, ch, attr)
+                        except curses.error: pass
+
+                        # Nearest object tracker
+                        dcol = scol - cols // 2
+                        drow = srow - rows // 2
+                        dist = math.sqrt(dcol*dcol + drow*drow)
+                        if dist < nearest_dist:
+                            nearest_dist = dist
+                            nearest = (typ, name, int(dist))
+
+        # Ship at center
+        ship_row = rows // 2
+        ship_col = cols // 2
+        ship_attr = curses.color_pair(5) | curses.A_BOLD
+        # Warp effect: streaks
+        if warp:
+            for i in range(1, 8):
+                try: stdscr.addch(ship_row, ship_col - i - 3, '-', curses.color_pair(2) | curses.A_DIM)
+                except curses.error: pass
+                try: stdscr.addch(ship_row, ship_col + i + 3, '-', curses.color_pair(2) | curses.A_DIM)
+                except curses.error: pass
+
+        for i, line in enumerate(SHIP):
+            r = ship_row - 1 + i
+            c = ship_col - len(line) // 2
+            for j, ch in enumerate(line):
+                if ch != ' ':
+                    try: stdscr.addch(r, c + j, ch, ship_attr)
+                    except curses.error: pass
+
+        # ── HUD ────────────────────────────────────────────────────────────
+        cx0 = int(cam_x / CHUNK_SIZE)
+        cy0 = int(cam_y / CHUNK_SIZE)
+        total_disc = sum(disc_counts.values())
+
+        hud_attr  = curses.color_pair(5) | curses.A_BOLD
+        val_attr  = curses.color_pair(1)
+        warn_attr = curses.color_pair(4) | curses.A_BOLD
+        red_attr  = curses.color_pair(7) | curses.A_BOLD
+        dim_attr  = curses.color_pair(1) | curses.A_DIM
+
+        def safe_addstr(r, c, s, attr=0):
+            try:
+                if 0 <= r < rows and 0 <= c < cols - 1:
+                    max_len = cols - c - 1
+                    stdscr.addstr(r, c, s[:max_len], attr)
+            except curses.error:
+                pass
+
+        # Top-left panel
+        safe_addstr(0, 0, '┌─ NAVIGATION ─────────────────', hud_attr)
+        safe_addstr(1, 0, f'│ X:{cam_x:8.1f}  Y:{cam_y:8.1f}', val_attr)
+        safe_addstr(2, 0, f'│ Sector : {sector_name(cx0, cy0)}', hud_attr)
+        safe_addstr(3, 0, f'│ Galaxy : {galaxy_name(cx0//4, cy0//4)}', hud_attr)
+        safe_addstr(4, 0, f'│ Zoom   : {zoom:.2f}x', val_attr)
+        spd_str = 'WARP >>>' if warp else 'CRUISE >'
+        safe_addstr(5, 0, f'│ Speed  : {spd_str}', warn_attr if warp else val_attr)
+        safe_addstr(6, 0, '└──────────────────────────────', hud_attr)
+
+        # Top-right panel
+        tr = 0
+        panel_w = 32
+        pc = cols - panel_w - 1
+        safe_addstr(tr+0, pc, '┌─ SCANNER ──────────────────┐', hud_attr)
+        if nearest:
+            ntyp, nname, ndist = nearest
+            nc = 7 if ntyp=='Black Hole' else (5 if ntyp=='Alien System' else 4)
+            safe_addstr(tr+1, pc, f'│ Nearest: {nname[:16]:<16}  │', curses.color_pair(nc)|curses.A_BOLD)
+            safe_addstr(tr+2, pc, f'│ Type   : {ntyp:<16}  │', curses.color_pair(nc))
+            safe_addstr(tr+3, pc, f'│ Dist   : {ndist:<16}  │', val_attr)
+        else:
+            safe_addstr(tr+1, pc, '│ Nothing in range           │', dim_attr)
+            safe_addstr(tr+2, pc, '│                            │', dim_attr)
+            safe_addstr(tr+3, pc, '│                            │', dim_attr)
+        safe_addstr(tr+4, pc, '└────────────────────────────┘', hud_attr)
+
+        # Bottom-left controls
+        bl = rows - 8
+        safe_addstr(bl+0, 0, '┌─ CONTROLS ────────────────', hud_attr)
+        safe_addstr(bl+1, 0, '│ W A S D   — move          ', dim_attr)
+        safe_addstr(bl+2, 0, '│ + / -     — zoom          ', dim_attr)
+        safe_addstr(bl+3, 0, '│ T         — toggle warp   ', dim_attr)
+        safe_addstr(bl+4, 0, '│ SPACE     — scan / discover', dim_attr)
+        safe_addstr(bl+5, 0, '│ R         — new universe  ', dim_attr)
+        safe_addstr(bl+6, 0, '│ Q / ESC   — quit          ', dim_attr)
+        safe_addstr(bl+7, 0, '└───────────────────────────', hud_attr)
+
+        # Bottom-right discoveries
+        br = rows - 8
+        safe_addstr(br+0, pc, '┌─ DISCOVERIES ──────────────┐', hud_attr)
+        safe_addstr(br+1, pc, f'│ Total   : {total_disc:<3}               │', hud_attr)
+        safe_addstr(br+2, pc, f'│ Planets : {disc_counts["Planet"]:<3}               │', curses.color_pair(2)|curses.A_BOLD)
+        safe_addstr(br+3, pc, f'│ Stars   : {disc_counts["Star"]:<3}               │', curses.color_pair(1))
+        safe_addstr(br+4, pc, f'│ B.Holes : {disc_counts["Black Hole"]:<3}               │', red_attr)
+        safe_addstr(br+5, pc, f'│ Nebulae : {disc_counts["Nebula"]:<3}               │', warn_attr)
+        safe_addstr(br+6, pc, f'│ Aliens  : {disc_counts["Alien System"]:<3}               │', curses.color_pair(5)|curses.A_BOLD)
+        safe_addstr(br+7, pc, '└────────────────────────────┘', hud_attr)
+
+        # Discovery message (center bottom)
+        if disc_msg and time.time() - disc_msg_time < 2.5:
+            msg_col = max(0, cols // 2 - len(disc_msg) // 2)
+            safe_addstr(rows // 2 - 4, msg_col, disc_msg, curses.color_pair(5) | curses.A_BOLD)
+
+        # Seed line top center
+        seed_str = f'SEED: {universe_seed:#010x}'
+        safe_addstr(0, cols//2 - len(seed_str)//2, seed_str, dim_attr)
+
+        stdscr.refresh()
+        time.sleep(0.03)  # ~30 fps
+
+def run():
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
+    print("\n\033[36mThank you for exploring the universe.\033[0m\n")
+
+if __name__ == '__main__':
+    run()
